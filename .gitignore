@@ -128,3 +128,13 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+
+# local dev files/folders
+*/bin/
+.vs/
+*/obj/
+*.local.json*
+*.Development.json
+*.development.config
+*.csproj.user
+*.pubxml.user
