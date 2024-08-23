@@ -1,3 +1,4 @@
+using Azure.Identity;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Toolkit.Uwp.Notifications;
 
@@ -42,7 +43,7 @@ namespace NetflixCrawlerService
             Console.WriteLine($"Crawl complete. Waiting for next scan at {TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, TimeZoneInfo.Local).AddMinutes(_minutesBetweenScans).ToShortTimeString()}.");
         }
 
-        private async Task SetOldJobsToNoLongerSeen(CrawledDataContext context, IEnumerable<Position> sitePositions)
+        private async Task SetOldJobsToNoLongerSeen(CrawledDataContext context, IEnumerable<PositionSummary> sitePositions)
         {
             var positionsList = sitePositions.ToList();
             var jobsToMarkAsNoLongerSeen = context.CrawledData
@@ -59,7 +60,7 @@ namespace NetflixCrawlerService
             await context.SaveChangesAsync();
         }
 
-        private async Task CrawlPositionData(CrawledDataContext context, Position position)
+        private async Task CrawlPositionData(CrawledDataContext context, PositionSummary position)
         {
             var existingData = await context.CrawledData
                 .FirstOrDefaultAsync(d => d.RequisitionId == position.display_job_id && d.CanonicalUrl == position.canonicalPositionUrl);
@@ -81,21 +82,29 @@ namespace NetflixCrawlerService
             await context.SaveChangesAsync();
         }
 
-        private async Task CreateNewJob(CrawledDataContext context, Position position)
+        private async Task CreateNewJob(CrawledDataContext context, PositionSummary positionSummary)
         {
+            // Crawl the job's full details and save them.
+            var fullPositionData = GetPositionData(positionSummary.id);
+
+            if (fullPositionData == null)
+            {
+                Console.WriteLine($"Failed to retrieve full data for job {positionSummary.display_job_id} ({positionSummary.name})");
+                return;
+            }
 
             var newData = new CrawledData
             {
-                JobId = (int)position.id,
-                CanonicalUrl = position.canonicalPositionUrl,
-                Url = $"[REDACTED]",
-                JobTitle = position.name,
-                Location = position.location,
-                RequisitionId = position.display_job_id,
-                PostingDate = DateTimeOffset.FromUnixTimeSeconds(position.t_create).DateTime,
-                Team = position.department,
-                IsRemote = position.work_location_option.Contains("remote"),
-                Content = position.job_description,
+                JobId = fullPositionData.id,
+                CanonicalUrl = fullPositionData.canonicalPositionUrl,
+                JsonUrl = $"[REDACTED]",
+                JobTitle = fullPositionData.name,
+                Location = fullPositionData.location,
+                RequisitionId = fullPositionData.display_job_id,
+                PostingDate = DateTimeOffset.FromUnixTimeSeconds(fullPositionData.t_create).DateTime,
+                Team = fullPositionData.department,
+                IsRemote = fullPositionData.custom_JD.data_fields.work_type.Contains("Remote"),
+                Description = fullPositionData.job_description,
                 FirstSeen = DateTime.Now,
                 LastSeen = DateTime.Now,
                 TimesCrawled = 1,
@@ -104,20 +113,27 @@ namespace NetflixCrawlerService
 
             Console.WriteLine($"New job found: {newData.RequisitionId} ({newData.JobTitle})");
 
-            context.CrawledData.Add(newData);
-            await context.SaveChangesAsync();
+            try
+            {
+                context.CrawledData.Add(newData);
+                await context.SaveChangesAsync();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to save new job data: {ex.Message}");
+            }
 
             ShowNotification(title: "New Netflix Job!", jobSummary: $"{newData.JobTitle} ({newData.Team} team) [Req {newData.RequisitionId}]", positionId: newData.JobId);
         }
 
-        private IEnumerable<Position> CollectJobData()
+        private IEnumerable<PositionSummary> CollectJobData()
         {
-            var result = new List<Position>();
+            var result = new List<PositionSummary>();
 
             int startNumber = 0;
             while (true)
             {
-                var jobData = GetJobData(startNumber);
+                var jobData = GetAllJobsData(startNumber);
 
                 if (jobData == null || !jobData.positions.Any())
                 {
@@ -144,25 +160,51 @@ namespace NetflixCrawlerService
             return result.AsEnumerable();
         }
 
-        private EightfoldJob? GetJobData(int startNumber)
+        private EightfoldPosition? GetPositionData(long positionId)
         {
-            Console.WriteLine($"Crawling results {startNumber}-{startNumber + 10}");
-            // Specifically looking for software engineering jobs at Netflix, but could potentially be any job
-            var url = $"[Redacted]";
-            var response = _httpClient.GetStringAsync(url).Result;
+            try
+            {
+                var url = $"[REDACTED]";
+                var response = _httpClient.GetStringAsync(url).Result;
 
-            // response is a JSON string, so we need to deserialize it to an EightfoldJob object
-            var jobData = System.Text.Json.JsonSerializer.Deserialize<EightfoldJob>(response);
-            return jobData;
+                var positionData = System.Text.Json.JsonSerializer.Deserialize<EightfoldPosition>(response);
+                return positionData;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to retrieve position data: {ex.Message}");
+                return null;
+            }
         }
 
-        public void ShowNotification(string title, string? jobSummary = null, string? url = null, int? positionId = null)
+        private EightfoldJobSummary? GetAllJobsData(int startNumber)
+        {
+            Console.WriteLine($"Crawling results {startNumber}-{startNumber + 10}");
+
+            try
+            {
+                // Specifically looking for software engineering jobs at Netflix, but could potentially be any job
+                var url = $"[REDACTED]";
+                var response = _httpClient.GetStringAsync(url).Result;
+
+                // response is a JSON string, so we need to deserialize it to an EightfoldJob object
+                var jobData = System.Text.Json.JsonSerializer.Deserialize<EightfoldJobSummary>(response);
+                return jobData;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to retrieve job data: {ex.Message}");
+                return null;
+            }
+        }
+
+        public void ShowNotification(string title, string? jobSummary = null, string? url = null, long? positionId = null)
         {
             var notification = new ToastContentBuilder()
                 .AddArgument("action", "viewContents")
                 .AddArgument("conversationId", 9813)
-                .AddText(title);
-            //.AddAppLogoOverride(new Uri("ms-appx:///img/Netflix_N.png"), ToastGenericAppLogoCrop.Circle);
+                .AddText(title)
+                .AddAppLogoOverride(new Uri("ms-appx:///img/Netflix_N.png"), ToastGenericAppLogoCrop.Circle);
 
             if (jobSummary != null)
             {
@@ -182,6 +224,8 @@ namespace NetflixCrawlerService
 
             notification.Show();
         }
+
+        // TODO: Implement actions for the notification
 
         public override void Dispose()
         {
